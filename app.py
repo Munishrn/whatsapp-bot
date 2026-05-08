@@ -694,4 +694,4 @@ def get_current_status(order_id):
 
 
 if __name__ == "__main__":
-    app.run(port=5000, debug=False)
+    app.run(port=10000, debug=False)
