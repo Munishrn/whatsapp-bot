@@ -1,5 +1,5 @@
-openpyxl
-requests
 flask
-dotenv
+requests
 python-dotenv
+gspread
+google-auth

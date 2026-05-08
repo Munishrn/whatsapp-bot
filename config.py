@@ -8,10 +8,9 @@ PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
 VERIFY_TOKEN    = os.environ.get("VERIFY_TOKEN", "my_verify_token")
 
 API_VERSION = "v19.0"
-EXCEL_FILE  = "orders.xlsx"
 
 STAFF_NUMBERS = [
-    "919779986649","919711576857"
+    "919779986649"
 ]
 
 STATUS_MAP = {

@@ -169,10 +169,7 @@ print("[Late Delivery Checker] Started — checking every 30 minutes.")
 
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
-@app.route("/", methods=["GET"])
-def health():
-    return "Bot is running!", 200
-    
+
 @app.route("/webhook", methods=["GET"])
 def verify():
     if request.args.get("hub.verify_token") == VERIFY_TOKEN:
@@ -659,55 +656,42 @@ def _apply_update(phone, order_id, update_type, new_status, delivery_str):
 
 def get_order_desc(order_id):
     """Get description for an order — used in notifications."""
-    import openpyxl
-    from config import EXCEL_FILE
-    from logic import excel_lock, COL_ID, COL_DESC
-    with excel_lock:
-        try:
-            wb = openpyxl.load_workbook(EXCEL_FILE)
-            sh = wb.active
-            for row in sh.iter_rows(min_row=2, values_only=True):
-                if str(row[COL_ID]) == str(order_id):
-                    return str(row[COL_DESC]) if row[COL_DESC] else ""
-        except Exception:
-            pass
+    from logic import get_all_rows, COL_ID, COL_DESC, _get_row_value
+    try:
+        rows = get_all_rows()
+        for row in rows:
+            if _get_row_value(row, COL_ID) == str(order_id):
+                return _get_row_value(row, COL_DESC)
+    except Exception:
+        pass
     return ""
 
 
 def get_order_delivery(order_id):
     """Get expected delivery time for an order."""
-    import openpyxl
-    from config import EXCEL_FILE
-    from logic import excel_lock, COL_ID, COL_DELIVERY
-    with excel_lock:
-        try:
-            wb = openpyxl.load_workbook(EXCEL_FILE)
-            sh = wb.active
-            for row in sh.iter_rows(min_row=2, values_only=True):
-                if str(row[COL_ID]) == str(order_id):
-                    return str(row[COL_DELIVERY]) if len(row) > COL_DELIVERY and row[COL_DELIVERY] else ""
-        except Exception:
-            pass
+    from logic import get_all_rows, COL_ID, COL_DELIVERY, _get_row_value
+    try:
+        rows = get_all_rows()
+        for row in rows:
+            if _get_row_value(row, COL_ID) == str(order_id):
+                return _get_row_value(row, COL_DELIVERY)
+    except Exception:
+        pass
     return ""
 
 
 def get_current_status(order_id):
     """Get current status of an order — used when updating delivery only."""
-    import openpyxl
-    from config import EXCEL_FILE
-    from logic import excel_lock, COL_ID, COL_STATUS
-    with excel_lock:
-        try:
-            wb = openpyxl.load_workbook(EXCEL_FILE)
-            sh = wb.active
-            for row in sh.iter_rows(min_row=2, values_only=True):
-                if str(row[COL_ID]) == str(order_id):
-                    return str(row[COL_STATUS]) if row[COL_STATUS] else "Order Received"
-        except Exception:
-            pass
-    return "Order Received"
+    from logic import get_all_rows, COL_ID, COL_STATUS, _get_row_value
+    try:
+        rows = get_all_rows()
+        for row in rows:
+            if _get_row_value(row, COL_ID) == str(order_id):
+                return _get_row_value(row, COL_STATUS) or "Design Making"
+    except Exception:
+        pass
+    return "Design Making"
 
 
 if __name__ == "__main__":
-    import os
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=False)
+    app.run(port=5000, debug=False)
