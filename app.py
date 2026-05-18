@@ -1,9 +1,21 @@
+import os
 import traceback
 import shelve
 import threading
 import time
 
 from flask import Flask, request
+
+from config_loader import (
+    feature_enabled,
+    get_client_config,
+    reload_configs,
+    get_status_map,
+    is_final_status,
+    is_cancelled_status,
+    is_ready_status,
+    skip_delivery_for_status,
+)
 
 from logic import (
     get_user_role,
@@ -13,9 +25,6 @@ from logic import (
     update_order,
     get_customer_phone,
     format_phone,
-    is_ready,
-    is_out_for_delivery,
-    is_cancelled,
     get_today_str,
     parse_date,
     parse_delivery_datetime,
@@ -23,89 +32,99 @@ from logic import (
     get_unique_clients,
     get_stale_orders,
     get_late_orders,
+    get_order_desc,
+    get_current_status,
 )
 
 from whatsapp import (
-    send_staff_menu,
-    send_customer_menu,
     send_text,
     send_back_button,
+    send_staff_menu,
+    send_customer_menu,
     send_status_list,
-    send_date_options,
-    send_view_options,
     send_create_order_type,
     send_existing_clients_list,
     send_update_options,
+    send_view_options,
+    send_date_options,
     send_delivery_date_picker,
     send_delivery_time_picker,
 )
 
-from config import VERIFY_TOKEN, STATUS_MAP, STAFF_NUMBERS
+from logger import log_conversation, log_error, cleanup_old_logs
+from sheets import archive_old_rows
 
 app = Flask(__name__)
 
 STATE_FILE = "user_state"
 TEMP_FILE  = "temp_data"
 
-# Track orders already notified for late delivery to avoid repeat messages
-notified_late = set()
+# Track late delivery notifications per client
+notified_late = {}
 
 
 # ── State helpers ─────────────────────────────────────────────────────────────
 
-def get_state(phone):
+def _key(cfg, phone):
+    """Unique key combining client ID and phone."""
+    return f"{cfg['phone_number_id']}:{phone}"
+
+
+def get_state(cfg, phone):
     with shelve.open(STATE_FILE) as db:
-        return db.get(phone)
+        return db.get(_key(cfg, phone))
 
 
-def set_state(phone, state):
+def set_state(cfg, phone, state):
     with shelve.open(STATE_FILE) as db:
-        db[phone] = state
+        db[_key(cfg, phone)] = state
 
 
-def clear_state(phone):
+def clear_state(cfg, phone):
     with shelve.open(STATE_FILE) as db:
-        db.pop(phone, None)
+        db.pop(_key(cfg, phone), None)
     with shelve.open(TEMP_FILE) as db:
-        db.pop(phone, None)
+        db.pop(_key(cfg, phone), None)
 
 
-def get_temp(phone):
+def get_temp(cfg, phone):
     with shelve.open(TEMP_FILE) as db:
-        return db.get(phone, {})
+        return db.get(_key(cfg, phone), {})
 
 
-def set_temp(phone, data):
+def set_temp(cfg, phone, data):
     with shelve.open(TEMP_FILE) as db:
-        db[phone] = data
+        db[_key(cfg, phone)] = data
 
 
-def update_temp(phone, key, value):
+def update_temp(cfg, phone, key, value):
     with shelve.open(TEMP_FILE) as db:
-        current = db.get(phone, {})
+        k       = _key(cfg, phone)
+        current = db.get(k, {})
         current[key] = value
-        db[phone] = current
+        db[k] = current
 
 
 # ── Notification helpers ──────────────────────────────────────────────────────
 
-def notify_ready(phone, order_id, description=""):
+def notify_ready(cfg, phone, order_id, description=""):
     msg = f"_🚚 Your order is Ready to be picked!_\n_Order ID: {order_id}_"
     if description:
         msg += f"\n_Product: {description}_"
-    send_text(phone, msg)
+    send_text(cfg, phone, msg)
+    log_conversation(cfg, phone, "customer", "outgoing", msg)
 
 
-def notify_cancelled(phone, order_id, description=""):
-    msg = f"_❌ We're sorry to inform you that your order has been cancelled._\n_Order ID: {order_id}_"
+def notify_cancelled(cfg, phone, order_id, description=""):
+    msg = f"_❌ We're sorry, your order has been cancelled._\n_Order ID: {order_id}_"
     if description:
         msg += f"\n_Product: {description}_"
     msg += "\n_Please contact us for more details._"
-    send_text(phone, msg)
+    send_text(cfg, phone, msg)
+    log_conversation(cfg, phone, "customer", "outgoing", msg)
 
 
-def notify_status_update(phone, order_id, status, description="", delivery="", changed="status"):
-    """Send auto notification to customer. changed= status | delivery | both"""
+def notify_status_update(cfg, phone, order_id, status, description="", delivery="", changed="status"):
     status_emojis = {
         "design making":      "🎨",
         "plate making":       "🖼️",
@@ -115,65 +134,233 @@ def notify_status_update(phone, order_id, status, description="", delivery="", c
         "cancelled":          "❌",
     }
     emoji = status_emojis.get(status.strip().lower(), "📋")
-    msg = f"_{emoji} Order Update!_\n_Order ID: {order_id}_"
+    msg   = f"_{emoji} Order Update!_\n_Order ID: {order_id}_"
     if description:
         msg += f"\n_Product: {description}_"
-    # ✅ Clearly mention what changed
     if changed == "status":
         msg += f"\n_✏️ Order status changed to: {status}_"
     elif changed == "delivery":
         msg += f"\n_Status: {status}_"
         if delivery:
-            msg += f"\n_🕐 Expected delivery date/time changed to: {delivery}_"
+            msg += f"\n_🕐 Expected delivery changed to: {delivery}_"
     elif changed == "both":
         msg += f"\n_✏️ Order status changed to: {status}_"
         if delivery:
-            msg += f"\n_🕐 Expected delivery date/time changed to: {delivery}_"
-    send_text(phone, msg)
+            msg += f"\n_🕐 Expected delivery changed to: {delivery}_"
+    send_text(cfg, phone, msg)
+    log_conversation(cfg, phone, "customer", "outgoing", msg)
 
 
-# ── Late delivery background checker ─────────────────────────────────────────
+# ── Apply update helper ───────────────────────────────────────────────────────
+
+def _apply_update(cfg, phone, order_id, update_type, new_status, delivery_str):
+    if update_type == "both":
+        success = update_order(order_id, new_status, cfg, delivery_str)
+        if success:
+            send_text(cfg, phone, f"✅ Order {order_id} updated\nStatus: {new_status}\nExpected Delivery: {delivery_str}")
+            cp   = get_customer_phone(order_id, cfg)
+            desc = get_order_desc(order_id, cfg)
+            if cp:
+                if is_ready_status(new_status, cfg):
+                    notify_ready(cfg, cp, order_id, desc)
+                elif is_cancelled_status(new_status, cfg):
+                    notify_cancelled(cfg, cp, order_id, desc)
+                else:
+                    notify_status_update(cfg, cp, order_id, new_status, desc, delivery_str, changed="both")
+        else:
+            send_text(cfg, phone, f"❌ Order {order_id} not found.")
+    else:
+        current = get_current_status(order_id, cfg)
+        success = update_order(order_id, current, cfg, delivery_str)
+        if success:
+            send_text(cfg, phone, f"✅ Delivery time updated for Order {order_id}\nNew Expected Delivery: {delivery_str}")
+            cp   = get_customer_phone(order_id, cfg)
+            desc = get_order_desc(order_id, cfg)
+            if cp:
+                notify_status_update(cfg, cp, order_id, current, desc, delivery_str, changed="delivery")
+        else:
+            send_text(cfg, phone, f"❌ Order {order_id} not found.")
+    clear_state(cfg, phone)
+
+
+# ── Late delivery checker ─────────────────────────────────────────────────────
 
 def late_delivery_checker():
-    """
-    Runs in background thread every 30 minutes.
-    Checks for orders past their delivery time and notifies customers.
-    """
     while True:
         try:
-            late_orders = get_late_orders()
-            for order in late_orders:
-                order_id = str(order["id"])
-                if order_id not in notified_late:
-                    send_text(
-                        order["phone"],
-                        f"_⏰ We apologize for the delay on your order._\n"
-                        f"_Order ID: {order_id}_\n"
-                        f"_Product: {order['description']}_\n"
-                        f"_Expected Delivery: {order['delivery']}_\n"
-                        f"_Current Status: {order['status']}_\n\n"
-                        f"_Our team is working on it. We will update you shortly. 🙏_"
-                    )
-                    notified_late.add(order_id)
-                    print(f"[Late Delivery] Notified customer for Order {order_id}")
+            from config_loader import load_all_clients
+            all_clients = load_all_clients()
+            for pid, cfg in all_clients.items():
+                client_key = cfg.get("business_name", pid)
+                if client_key not in notified_late:
+                    notified_late[client_key] = set()
+
+                if not feature_enabled(cfg, "late_delivery_alert"):
+                    continue
+                late_orders = get_late_orders(cfg)
+                for order in late_orders:
+                    order_id = str(order["id"])
+                    if order_id not in notified_late[client_key]:
+                        msg = (
+                            f"_⏰ We apologize for the delay on your order._\n"
+                            f"_Order ID: {order_id}_\n"
+                            f"_Product: {order['description']}_\n"
+                            f"_Expected Delivery: {order['delivery']}_\n"
+                            f"_Current Status: {order['status']}_\n\n"
+                            f"_Our team is working on it. We will update you shortly. 🙏_"
+                        )
+                        send_text(cfg, order["phone"], msg)
+                        log_conversation(cfg, order["phone"], "customer", "outgoing", msg)
+                        notified_late[client_key].add(order_id)
+
+                # Cleanup old logs daily (every 24hrs = 48 × 30min cycles)
+                # We use a simple counter approach
         except Exception as e:
-            print(f"[Late Delivery Checker Error] {e}")
+            print(f"[Late Checker Error] {e}")
 
-        time.sleep(30 * 60)  # Check every 30 minutes
+        time.sleep(30 * 60)
 
 
-# Start background thread
 checker_thread = threading.Thread(target=late_delivery_checker, daemon=True)
 checker_thread.start()
-print("[Late Delivery Checker] Started — checking every 30 minutes.")
+print("[Late Delivery Checker] Started.")
+
+
+def daily_cleanup():
+    """
+    Runs daily at midnight.
+    Archives old orders and cleans up old logs for all clients.
+    """
+    import time as _time
+    from datetime import datetime as _dt
+
+    while True:
+        now = _dt.now()
+        # Calculate seconds until next midnight
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        from datetime import timedelta
+        next_midnight = midnight + timedelta(days=1)
+        seconds_until_midnight = (next_midnight - now).total_seconds()
+        print(f"[Cleanup] Next cleanup at midnight ({int(seconds_until_midnight/3600)}hrs away)")
+        _time.sleep(seconds_until_midnight)
+
+        # Run cleanup for all clients
+        try:
+            from config_loader import load_all_clients
+            all_clients = load_all_clients()
+            for pid, cfg in all_clients.items():
+                sheet_id      = cfg.get("google_sheet_id")
+                retention     = cfg.get("order_retention_days", 30)
+                business_name = cfg.get("business_name", pid)
+
+                if not sheet_id:
+                    continue
+
+                try:
+                    # Archive old orders
+                    archived = archive_old_rows(
+                        sheet_id,
+                        source_tab="Orders",
+                        archive_tab="Archived Orders",
+                        date_col_index=5,  # COL_DATE
+                        days=retention
+                    )
+                    if archived:
+                        print(f"[Cleanup] {business_name}: Archived {archived} orders")
+
+                    # Cleanup old conversation and error logs
+                    cleanup_old_logs(cfg)
+
+                except Exception as e:
+                    print(f"[Cleanup Error] {business_name}: {e}")
+
+        except Exception as e:
+            print(f"[Cleanup Error] {e}")
+
+
+cleanup_thread = threading.Thread(target=daily_cleanup, daemon=True)
+cleanup_thread.start()
+print("[Daily Cleanup] Started — runs at midnight.")
+
+
+# ── Daily cleanup scheduler ───────────────────────────────────────────────────
+
+def daily_cleanup():
+    """
+    Runs every night at midnight.
+    Archives old orders and cleans old conversation/error logs.
+    """
+    from sheets import archive_old_rows
+    from datetime import datetime, timedelta
+
+    while True:
+        now      = datetime.now()
+        # Calculate seconds until next midnight
+        midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        wait_sec = (midnight - now).total_seconds()
+        print(f"[Cleanup] Next cleanup scheduled at midnight ({int(wait_sec/3600)}h {int((wait_sec%3600)/60)}m away)")
+        time.sleep(wait_sec)
+
+        # Run cleanup for all clients
+        try:
+            from config_loader import load_all_clients
+            all_clients = load_all_clients()
+            for pid, cfg in all_clients.items():
+                sheet_id     = cfg.get("google_sheet_id")
+                business     = cfg.get("business_name", pid)
+                retain_days  = cfg.get("order_retention_days", 30)
+
+                if not sheet_id:
+                    continue
+
+                try:
+                    # Archive old orders
+                    archived = archive_old_rows(
+                        sheet_id,
+                        source_tab="Orders",
+                        archive_tab="Orders Archive",
+                        date_col_index=5,  # COL_DATE
+                        days=retain_days
+                    )
+                    if archived:
+                        print(f"[Cleanup] {business}: Archived {archived} orders older than {retain_days} days")
+
+                    # Clean old conversation and error logs
+                    from logger import cleanup_old_logs
+                    cleanup_old_logs(cfg)
+
+                except Exception as e:
+                    print(f"[Cleanup Error] {business}: {e}")
+
+        except Exception as e:
+            print(f"[Cleanup Error] {e}")
+
+
+cleanup_thread = threading.Thread(target=daily_cleanup, daemon=True)
+cleanup_thread.start()
+print("[Daily Cleanup] Started — runs every midnight.")
 
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
 
+@app.route("/", methods=["GET"])
+def health():
+    from config_loader import load_all_clients
+    clients = load_all_clients()
+    return f"WhatsApp SaaS Bot — {len(clients)} client(s) active ✅", 200
+
+
 @app.route("/webhook", methods=["GET"])
 def verify():
-    if request.args.get("hub.verify_token") == VERIFY_TOKEN:
-        return request.args.get("hub.challenge")
+    """Handle Meta webhook verification for all clients."""
+    token     = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+
+    # Check against all client verify tokens
+    from config_loader import load_all_clients
+    for pid, cfg in load_all_clients().items():
+        if token == cfg.get("verify_token"):
+            return challenge
     return "Verification failed", 403
 
 
@@ -189,19 +376,37 @@ def webhook():
         if not changes:
             return "ok"
         value = changes[0].get("value", {})
+
+        # ✅ Identify client by phone_number_id from webhook payload
+        phone_number_id = value.get("metadata", {}).get("phone_number_id")
+        cfg = get_client_config(phone_number_id)
+
+        if not cfg:
+            print(f"[Webhook] Unknown phone_number_id: {phone_number_id}")
+            return "ok"
+
         messages = value.get("messages", [])
         if not messages:
             return "ok"
 
-        message = messages[0]
-        phone   = message["from"]
-        role    = get_user_role(phone)
-        state   = get_state(phone)
+        message    = messages[0]
+        phone      = message["from"]
+        role       = get_user_role(phone, cfg)
+        state      = get_state(cfg, phone)
+        status_map = get_status_map(cfg)
+
+        # Log incoming message
+        if "text" in message:
+            log_conversation(cfg, phone, role, "incoming", message["text"]["body"])
+        elif "interactive" in message:
+            interactive = message["interactive"]
+            btn = interactive.get("button_reply", {}).get("title") or \
+                  interactive.get("list_reply", {}).get("title", "button")
+            log_conversation(cfg, phone, role, "incoming", f"[Button: {btn}]")
 
         # ── INTERACTIVE ───────────────────────────────────────────────────
         if "interactive" in message:
             interactive = message["interactive"]
-
             if "button_reply" in interactive:
                 button_id = interactive["button_reply"]["id"]
             elif "list_reply" in interactive:
@@ -209,490 +414,408 @@ def webhook():
             else:
                 return "ok"
 
-            # Back to menu
             if button_id == "back_to_menu":
-                clear_state(phone)
+                clear_state(cfg, phone)
                 if role == "staff":
-                    send_staff_menu(phone)
+                    send_staff_menu(cfg, phone)
                 else:
-                    send_customer_menu(phone)
+                    send_customer_menu(cfg, phone)
 
-            # Create order
+            elif button_id == "todays_orders":
+                # ✅ Show all orders created today with ID, description, status
+                today   = get_today_str()
+                rows    = get_orders_by_date(today, phone, role, cfg)
+                send_back_button(cfg, phone, rows)
+
             elif button_id == "create_order":
-                send_create_order_type(phone)
+                send_create_order_type(cfg, phone)
 
             elif button_id == "client_new":
-                set_state(phone, "create_name")
-                send_back_button(phone, "Enter Customer Name:")
+                set_state(cfg, phone, "create_name")
+                send_back_button(cfg, phone, "Enter Customer Name:")
 
             elif button_id == "client_existing":
-                clients = get_unique_clients()
+                clients = get_unique_clients(cfg)
                 if not clients:
-                    send_text(phone, "❌ No existing clients found. Please create a new client.")
-                    send_create_order_type(phone)
+                    send_text(cfg, phone, "❌ No existing clients found.")
+                    send_create_order_type(cfg, phone)
                 else:
-                    set_state(phone, "select_existing_client")
-                    send_existing_clients_list(phone, clients)
+                    set_state(cfg, phone, "select_existing_client")
+                    send_existing_clients_list(cfg, phone, clients)
 
-            # Update order
             elif button_id == "update_order":
-                set_state(phone, "update_order_id")
-                send_back_button(phone, "Enter Order ID to update:")
+                if not feature_enabled(cfg, "update_status"):
+                    send_text(cfg, phone, "❌ Order updates are not enabled for your account.")
+                    send_staff_menu(cfg, phone)
+                else:
+                    set_state(cfg, phone, "update_order_id")
+                    send_back_button(cfg, phone, "Enter Order ID to update:")
 
-            # What to update — status, delivery, or both
             elif button_id == "update_status_only" and state == "update_what":
-                update_temp(phone, "update_type", "status")
-                set_state(phone, "update_status")
-                send_status_list(phone, f"Select new status for Order {get_temp(phone).get('order_id')}:")
+                update_temp(cfg, phone, "update_type", "status")
+                set_state(cfg, phone, "update_status")
+                send_status_list(cfg, phone, f"Select new status for Order {get_temp(cfg, phone).get('order_id')}:")
 
             elif button_id == "update_delivery_only" and state == "update_what":
-                update_temp(phone, "update_type", "delivery")
-                set_state(phone, "update_delivery_date")
-                send_delivery_date_picker(phone)
+                # ✅ Block if expected_delivery is disabled
+                if not feature_enabled(cfg, "expected_delivery"):
+                    send_text(cfg, phone, "❌ Expected delivery is not enabled for your account.")
+                    send_staff_menu(cfg, phone)
+                else:
+                    update_temp(cfg, phone, "update_type", "delivery")
+                    set_state(cfg, phone, "update_delivery_date")
+                    send_delivery_date_picker(cfg, phone)
 
             elif button_id == "update_both" and state == "update_what":
-                update_temp(phone, "update_type", "both")
-                set_state(phone, "update_status")
-                send_status_list(phone, f"Select new status for Order {get_temp(phone).get('order_id')}:")
+                # ✅ If expected_delivery disabled, treat "both" as "status only"
+                if not feature_enabled(cfg, "expected_delivery"):
+                    update_temp(cfg, phone, "update_type", "status")
+                else:
+                    update_temp(cfg, phone, "update_type", "both")
+                set_state(cfg, phone, "update_status")
+                send_status_list(cfg, phone, f"Select new status for Order {get_temp(cfg, phone).get('order_id')}:")
 
-            # View orders
             elif button_id == "view_orders":
-                send_view_options(phone)
+                send_view_options(cfg, phone)
 
             elif button_id == "view_order":
-                set_state(phone, "view_order")
-                send_back_button(phone, "Enter Order ID to view:")
+                set_state(cfg, phone, "view_order")
+                send_back_button(cfg, phone, "Enter Order ID to view:")
 
             elif button_id == "view_by_date":
-                set_state(phone, "view_by_date")
-                send_date_options(phone)
+                if not feature_enabled(cfg, "orders_by_date"):
+                    send_text(cfg, phone, "❌ Orders by date is not enabled for your account.")
+                    if role == "staff":
+                        send_staff_menu(cfg, phone)
+                    else:
+                        send_customer_menu(cfg, phone)
+                else:
+                    set_state(cfg, phone, "view_by_date")
+                    send_date_options(cfg, phone)
 
             elif button_id.startswith("filter_date_") and state == "view_by_date":
                 date_val = button_id.replace("filter_date_", "")
                 if date_val == "custom":
-                    set_state(phone, "enter_specific_date")
-                    send_back_button(phone, "Enter date as DD-MM-YYYY\nExample: 28-04-2026")
+                    set_state(cfg, phone, "enter_specific_date")
+                    send_back_button(cfg, phone, "Enter date as DD-MM-YYYY\nExample: 28-04-2026")
                 else:
-                    result = get_orders_by_date(date_val, phone, role)
-                    send_back_button(phone, result)
-                    clear_state(phone)
+                    result = get_orders_by_date(date_val, phone, role, cfg)
+                    send_back_button(cfg, phone, result)
+                    clear_state(cfg, phone)
 
-            # Customer track order
             elif button_id == "check_status":
-                set_state(phone, "check_status")
-                send_text(phone, "Enter your Order ID:")
+                if not feature_enabled(cfg, "customer_tracking"):
+                    send_text(cfg, phone, "❌ Order tracking is not enabled. Please contact us directly.")
+                else:
+                    set_state(cfg, phone, "check_status")
+                    send_text(cfg, phone, "Enter your Order ID:")
 
-            # ── Delivery date selected from picker ──────────────────────
+            elif button_id.startswith("existing_client_") and state == "select_existing_client":
+                parts        = button_id.split("_", 3)
+                client_phone = parts[3] if len(parts) > 3 else ""
+                client_name  = interactive.get("list_reply", {}).get("title", "")
+                set_temp(cfg, phone, {"name": client_name, "phone": client_phone})
+                set_state(cfg, phone, "create_description")
+                send_back_button(cfg, phone, f"✅ Client: {client_name}\nEnter Description/Product:")
+
             elif button_id.startswith("del_date_"):
                 date_val = button_id.replace("del_date_", "")
                 if date_val == "custom":
-                    # Ask staff to type custom date
                     if state and state.startswith("update"):
-                        set_state(phone, "update_delivery_custom_date")
+                        set_state(cfg, phone, "update_delivery_custom_date")
                     else:
-                        set_state(phone, "create_delivery_custom_date")
-                    send_back_button(phone, "Enter custom date as DD-MM-YYYY\nExample: 05-05-2026\nNote: Must be today or a future date")
+                        set_state(cfg, phone, "create_delivery_custom_date")
+                    send_back_button(cfg, phone, "Enter custom date as DD-MM-YYYY\nExample: 05-05-2026")
                 else:
-                    # Date selected — now pick time
-                    update_temp(phone, "delivery_date", date_val)
+                    update_temp(cfg, phone, "delivery_date", date_val)
                     if state and state.startswith("update"):
-                        set_state(phone, "update_delivery_time")
+                        set_state(cfg, phone, "update_delivery_time")
                     else:
-                        set_state(phone, "create_delivery_time")
-                    send_delivery_time_picker(phone, date_val)
+                        set_state(cfg, phone, "create_delivery_time")
+                    send_delivery_time_picker(cfg, phone, date_val)
 
-            # ── Delivery time selected from picker ──────────────────────
             elif button_id.startswith("del_time_"):
                 time_val = button_id.replace("del_time_", "")
-                d = get_temp(phone)
+                d        = get_temp(cfg, phone)
 
                 if time_val == "custom":
-                    # Custom time — ask to type HH:MM manually
-                    d = get_temp(phone)
                     delivery_date = d.get("delivery_date", "")
                     if state and state.startswith("update"):
-                        set_state(phone, "update_delivery_custom_time")
+                        set_state(cfg, phone, "update_delivery_custom_time")
                     else:
-                        set_state(phone, "create_delivery_custom_time")
-                    send_back_button(phone, f"Enter custom time for {delivery_date} as HH:MM\nExample: 14:30 for 2:30 PM\n16:45 for 4:45 PM")
+                        set_state(cfg, phone, "create_delivery_custom_time")
+                    send_back_button(cfg, phone, f"Enter custom time for {delivery_date} as HH:MM\nExample: 14:30")
                 else:
                     delivery_date = d.get("delivery_date", "")
-                    dt_str = f"{delivery_date} {time_val}"
-                    dt = parse_delivery_datetime(dt_str)
-
-                    # ✅ Validate — reject if selected time is in the past
+                    dt_str  = f"{delivery_date} {time_val}"
+                    dt      = parse_delivery_datetime(dt_str)
                     from datetime import datetime as dt_class
                     if dt and dt <= dt_class.now():
-                        send_delivery_time_picker(phone, delivery_date)
-                        send_text(phone, "⚠️ That time has already passed. Please select a future time slot.")
+                        send_delivery_time_picker(cfg, phone, delivery_date)
+                        send_text(cfg, phone, "⚠️ That time has already passed. Please select a future time slot.")
                         return "ok"
-
                     delivery_str = format_delivery_str(dt) if dt else dt_str
 
                     if state and state.startswith("update"):
                         order_id    = d.get("order_id")
                         update_type = d.get("update_type", "delivery")
                         new_status  = d.get("new_status")
-                        _apply_update(phone, order_id, update_type, new_status, delivery_str)
+                        _apply_update(cfg, phone, order_id, update_type, new_status, delivery_str)
                     else:
-                        # Create order
-                        order_id = create_order(d["name"], d["description"], d["status"], d["phone"], delivery_str)
-                        send_text(
-                            d["phone"],
-                            f"_📦 Order Created!_\n"
-                            f"_Order ID: {order_id}_\n"
-                            f"_Product: {d['description']}_\n"
-                            f"_Status: {d['status']}_\n"
+                        order_id = create_order(d["name"], d["description"], d["status"], d["phone"], delivery_str, cfg)
+                        send_text(cfg, d["phone"],
+                            f"_📦 Order Created!_\n_Order ID: {order_id}_\n"
+                            f"_Product: {d['description']}_\n_Status: {d['status']}_\n"
                             f"_Expected Delivery: {delivery_str}_"
                         )
-                        send_text(phone, f"✅ Order Created\nOrder ID: {order_id}\nExpected Delivery: {delivery_str}")
-                        clear_state(phone)
+                        send_text(cfg, phone, f"✅ Order Created\nOrder ID: {order_id}\nExpected Delivery: {delivery_str}")
+                        clear_state(cfg, phone)
 
-            # Existing client selected
-            elif button_id.startswith("existing_client_") and state == "select_existing_client":
-                parts = button_id.split("_", 3)
-                client_phone = parts[3] if len(parts) > 3 else ""
-                client_name  = interactive.get("list_reply", {}).get("title", "")
-                set_temp(phone, {"name": client_name, "phone": client_phone})
-                set_state(phone, "create_description")
-                send_back_button(phone, f"✅ Client: {client_name}\nEnter Description/Product:")
-
-            # Status selected during CREATE
             elif button_id.startswith("status_") and state == "create_status":
-                status = STATUS_MAP.get(button_id)
+                status = status_map.get(button_id)
                 if not status:
-                    send_text(phone, "❌ Invalid status selected.")
+                    send_text(cfg, phone, "❌ Invalid status selected.")
                     return "ok"
-                update_temp(phone, "status", status)
-                # ✅ Skip delivery picker for final statuses
-                skip_delivery = {"ready to be picked", "out for delivery", "cancelled"}
-                if status.strip().lower() in skip_delivery:
-                    d = get_temp(phone)
-                    order_id = create_order(d["name"], d["description"], status, d["phone"], "")
-                    send_text(
-                        d["phone"],
-                        f"_📦 Order Created!_\n"
-                        f"_Order ID: {order_id}_\n"
-                        f"_Product: {d['description']}_\n"
-                        f"_Status: {status}_"
+                update_temp(cfg, phone, "status", status)
+                if skip_delivery_for_status(status, cfg) or not feature_enabled(cfg, "expected_delivery"):
+                    d        = get_temp(cfg, phone)
+                    order_id = create_order(d["name"], d["description"], status, d["phone"], "", cfg)
+                    send_text(cfg, d["phone"],
+                        f"_📦 Order Created!_\n_Order ID: {order_id}_\n"
+                        f"_Product: {d['description']}_\n_Status: {status}_"
                     )
-                    send_text(phone, f"✅ Order Created\nOrder ID: {order_id}\nStatus: {status}")
-                    if is_cancelled(status):
-                        cp = get_customer_phone(order_id)
-                        if cp:
-                            notify_cancelled(cp, order_id, d["description"])
-                    clear_state(phone)
+                    send_text(cfg, phone, f"✅ Order Created\nOrder ID: {order_id}\nStatus: {status}")
+                    if is_cancelled_status(status, cfg):
+                        notify_cancelled(cfg, d["phone"], order_id, d["description"])
+                    clear_state(cfg, phone)
                 else:
-                    set_state(phone, "create_delivery_date")
-                    send_delivery_date_picker(phone)
+                    set_state(cfg, phone, "create_delivery_date")
+                    send_delivery_date_picker(cfg, phone)
 
-            # Status selected during UPDATE
             elif button_id.startswith("status_") and state == "update_status":
-                status = STATUS_MAP.get(button_id)
+                status      = status_map.get(button_id)
                 if not status:
-                    send_text(phone, "❌ Invalid status selected.")
+                    send_text(cfg, phone, "❌ Invalid status selected.")
                     return "ok"
-
-                d        = get_temp(phone)
-                order_id = d.get("order_id")
+                d           = get_temp(cfg, phone)
+                order_id    = d.get("order_id")
                 update_type = d.get("update_type", "status")
 
-                if update_type == "both":
-                    # ✅ Skip delivery picker for final statuses
-                    skip_delivery = {"ready to be picked", "out for delivery", "cancelled"}
-                    if status.strip().lower() in skip_delivery:
-                        update_temp(phone, "new_status", status)
-                        order_id = get_temp(phone).get("order_id")
-                        success = update_order(order_id, status)
-                        if success:
-                            send_text(phone, f"✅ Order {order_id} updated to: {status}")
-                            cp   = get_customer_phone(order_id)
-                            desc = get_order_desc(order_id)
-                            if cp:
-                                if is_cancelled(status):
-                                    notify_cancelled(cp, order_id, desc)
-                                elif is_ready(status):
-                                    notify_ready(cp, order_id, desc)
-                                else:
-                                    notify_status_update(cp, order_id, status, desc, "", changed="status")
-                        else:
-                            send_text(phone, f"❌ Order {order_id} not found.")
-                        clear_state(phone)
-                    else:
-                        # Save status, then show date picker
-                        update_temp(phone, "new_status", status)
-                        set_state(phone, "update_delivery_date")
-                        send_delivery_date_picker(phone)
+                if update_type == "both" and not skip_delivery_for_status(status, cfg):
+                    update_temp(cfg, phone, "new_status", status)
+                    set_state(cfg, phone, "update_delivery_date")
+                    send_delivery_date_picker(cfg, phone)
                 else:
-                    # Status only — notify customer on every change
-                    success = update_order(order_id, status)
+                    # Status only OR final status (skip delivery)
+                    success = update_order(order_id, status, cfg)
                     if success:
-                        send_text(phone, f"✅ Order {order_id} updated to: {status}")
-                        cp   = get_customer_phone(order_id)
-                        desc = get_order_desc(order_id)
+                        send_text(cfg, phone, f"✅ Order {order_id} updated to: {status}")
+                        cp   = get_customer_phone(order_id, cfg)
+                        desc = get_order_desc(order_id, cfg)
                         if cp:
-                            if is_ready(status):
-                                notify_ready(cp, order_id, desc)
-                            elif is_cancelled(status):
-                                notify_cancelled(cp, order_id, desc)
+                            if is_ready_status(status, cfg):
+                                notify_ready(cfg, cp, order_id, desc)
+                            elif is_cancelled_status(status, cfg):
+                                notify_cancelled(cfg, cp, order_id, desc)
                             else:
-                                delivery = get_order_delivery(order_id)
-                                notify_status_update(cp, order_id, status, desc, delivery, changed="status")
+                                delivery = ""
+                                notify_status_update(cfg, cp, order_id, status, desc, delivery, changed="status")
                     else:
-                        send_text(phone, f"❌ Order {order_id} not found.")
-                    clear_state(phone)
+                        send_text(cfg, phone, f"❌ Order {order_id} not found.")
+                    clear_state(cfg, phone)
 
         # ── TEXT ──────────────────────────────────────────────────────────
         elif "text" in message:
             text = message["text"]["body"].strip()
 
-            hinglish_greetings = [
+            greetings = [
                 "hi", "hello", "menu", "start", "hii", "hiii", "hey",
-                "namaste", "namaskar", "namsate", "sat sri akal",
-                "sat shri akal", "ssa", "salaam", "adaab", "hy", "helo",
-                "order", "help", "madad", "kya hai", "kya h", "bhai", "ji",
-                "hello ji", "hi ji", "hey ji",
+                "namaste", "namaskar", "sat sri akal", "sat shri akal", "ssa",
+                "salaam", "adaab", "hy", "helo", "order", "help", "madad",
+                "kya hai", "kya h", "bhai", "ji", "hello ji", "hi ji", "hey ji",
             ]
 
-            if text.lower().strip() in hinglish_greetings:
-                clear_state(phone)
+            if text.lower().strip() in greetings:
+                clear_state(cfg, phone)
                 if role == "staff":
-                    stale = get_stale_orders(hours=6)
-                    if stale:
-                        lines = [f"⚠️ Stale Orders Alert — {len(stale)} order(s) not updated in 6+ hours:\n"]
-                        for o in stale:
-                            lines.append(
-                                f"🆔 Order {o['id']} | 👤 {o['customer']} | 📦 {o['description']}\n"
-                                f"   Status: {o['status']} | 🕐 Created: {o.get('created_at', 'N/A')}"
-                            )
-                        send_text(phone, "\n".join(lines))
-                    send_staff_menu(phone)
+                    if feature_enabled(cfg, "stale_orders_alert"):
+                        stale = get_stale_orders(cfg, hours=cfg.get('stale_order_hours', 6))
+                        if stale:
+                            hours = cfg.get("stale_order_hours", 6)
+                            mins  = int(hours * 60) if hours < 1 else int(hours)
+                            unit  = "min(s)" if hours < 1 else "hour(s)"
+                            lines = [f"⚠️ Stale Orders Alert — {len(stale)} order(s) not updated in {mins}+ {unit}:\n"]
+                            for o in stale:
+                                lines.append(
+                                    f"🆔 Order {o['id']} | 👤 {o['customer']} | 📦 {o['description']}\n"
+                                    f"   Status: {o['status']} | 🕐 Created: {o.get('created_at', 'N/A')}"
+                                )
+                            send_text(cfg, phone, "\n".join(lines))
+                    send_staff_menu(cfg, phone)
                 else:
-                    send_customer_menu(phone)
+                    send_customer_menu(cfg, phone)
 
             elif state == "enter_specific_date":
                 parsed = parse_date(text)
                 if not parsed:
-                    # ✅ Use send_text not send_back_button — Back button would clear state
-                    send_text(phone, "❌ Invalid date format. Please enter as DD-MM-YYYY\nExample: 28-04-2026")
+                    send_text(cfg, phone, "❌ Invalid date format. Please enter as DD-MM-YYYY\nExample: 28-04-2026")
                     return "ok"
-                result = get_orders_by_date(parsed, phone, role)
-                send_back_button(phone, result)
-                clear_state(phone)
+                result = get_orders_by_date(parsed, phone, role, cfg)
+                send_back_button(cfg, phone, result)
+                clear_state(cfg, phone)
 
             elif state == "create_name":
-                set_temp(phone, {"name": text})
-                set_state(phone, "create_description")
-                send_back_button(phone, "Enter Description/Product:")
+                set_temp(cfg, phone, {"name": text})
+                set_state(cfg, phone, "create_description")
+                send_back_button(cfg, phone, "Enter Description/Product:")
 
             elif state == "create_description":
-                update_temp(phone, "description", text)
-                d = get_temp(phone)
+                update_temp(cfg, phone, "description", text)
+                d = get_temp(cfg, phone)
                 if d.get("phone"):
-                    set_state(phone, "create_status")
-                    send_status_list(phone, "Select Order Status:")
+                    set_state(cfg, phone, "create_status")
+                    send_status_list(cfg, phone, "Select Order Status:")
                 else:
-                    set_state(phone, "create_phone")
-                    send_back_button(phone, "Enter Customer Phone Number:")
+                    set_state(cfg, phone, "create_phone")
+                    send_back_button(cfg, phone, "Enter Customer Phone Number:")
 
             elif state == "create_phone":
                 formatted = format_phone(text)
                 if not formatted:
-                    send_back_button(phone, "❌ Invalid number. Enter 10-digit or 12-digit with country code:")
+                    send_back_button(cfg, phone, "❌ Invalid number. Enter 10-digit or 12-digit with country code:")
                     return "ok"
-                update_temp(phone, "phone", formatted)
-                set_state(phone, "create_status")
-                send_status_list(phone, "Select Order Status:")
+                update_temp(cfg, phone, "phone", formatted)
+                set_state(cfg, phone, "create_status")
+                send_status_list(cfg, phone, "Select Order Status:")
 
             elif state == "create_delivery_custom_date":
-                # Staff entered a custom date manually
-                from logic import parse_date as pd
-                parsed = pd(text)
+                parsed = parse_date(text)
                 if not parsed:
-                    send_back_button(phone, "❌ Invalid date. Enter as DD-MM-YYYY\nExample: 30-04-2026")
+                    send_back_button(cfg, phone, "❌ Invalid date. Enter as DD-MM-YYYY\nExample: 14-05-2026")
                     return "ok"
-                update_temp(phone, "delivery_date", parsed)
-                set_state(phone, "create_delivery_time")
-                send_delivery_time_picker(phone, parsed)
+                # ✅ Reject past dates
+                from datetime import datetime as dt_class
+                try:
+                    sel_dt = dt_class.strptime(parsed, "%d-%m-%Y")
+                    if sel_dt.date() < dt_class.now().date():
+                        send_back_button(cfg, phone, f"❌ {parsed} is in the past.\nPlease enter today or a future date:")
+                        return "ok"
+                except Exception:
+                    pass
+                update_temp(cfg, phone, "delivery_date", parsed)
+                set_state(cfg, phone, "create_delivery_time")
+                send_delivery_time_picker(cfg, phone, parsed)
 
             elif state == "create_delivery_custom_time":
                 from datetime import datetime as dt_class
-                d = get_temp(phone)
+                d      = get_temp(cfg, phone)
                 dt_str = f"{d['delivery_date']} {text.strip()}"
-                dt = parse_delivery_datetime(dt_str)
+                dt     = parse_delivery_datetime(dt_str)
                 if not dt:
-                    send_back_button(phone, "❌ Invalid time. Enter as HH:MM\nExample: 14:00")
+                    send_back_button(cfg, phone, "❌ Invalid time. Enter as HH:MM\nExample: 14:30")
                     return "ok"
-                # ✅ Validate past time
                 if dt <= dt_class.now():
-                    send_back_button(phone, "⚠️ That time has already passed.\nEnter a future time as HH:MM\nExample: 14:00")
+                    send_back_button(cfg, phone, "⚠️ That time has already passed.\nEnter a future time as HH:MM")
                     return "ok"
                 delivery_str = format_delivery_str(dt)
-                order_id = create_order(d["name"], d["description"], d["status"], d["phone"], delivery_str)
-                send_text(
-                    d["phone"],
-                    f"_📦 Order Created!_\n"
-                    f"_Order ID: {order_id}_\n"
-                    f"_Product: {d['description']}_\n"
-                    f"_Status: {d['status']}_\n"
+                order_id = create_order(d["name"], d["description"], d["status"], d["phone"], delivery_str, cfg)
+                send_text(cfg, d["phone"],
+                    f"_📦 Order Created!_\n_Order ID: {order_id}_\n"
+                    f"_Product: {d['description']}_\n_Status: {d['status']}_\n"
                     f"_Expected Delivery: {delivery_str}_"
                 )
-                send_text(phone, f"✅ Order Created\nOrder ID: {order_id}\nExpected Delivery: {delivery_str}")
-                clear_state(phone)
+                send_text(cfg, phone, f"✅ Order Created\nOrder ID: {order_id}\nExpected Delivery: {delivery_str}")
+                clear_state(cfg, phone)
 
             elif state == "update_order_id":
-                check = get_order_status(text, phone)
+                check   = get_order_status(text, phone, cfg)
+                current = get_current_status(text, cfg)
                 if "not found" in check.lower():
-                    send_back_button(phone, f"❌ Order {text} not found.\n\nPlease enter a valid Order ID:")
+                    send_back_button(cfg, phone, f"❌ Order {text} not found.\n\nPlease enter a valid Order ID:")
+                elif is_final_status(current, cfg):
+                    send_back_button(cfg, phone, f"🔒 Order {text} is in '{current}' status and cannot be updated further.")
                 else:
-                    # ✅ Check if order is in a final locked status
-                    current = get_current_status(text)
-                    locked_statuses = {"ready to be picked", "out for delivery", "cancelled"}
-                    if current.strip().lower() in locked_statuses:
-                        send_back_button(phone, f"🔒 Order {text} is in '{current}' status and cannot be updated further.")
-                    else:
-                        set_temp(phone, {"order_id": text})
-                        set_state(phone, "update_what")
-                        send_update_options(phone)
+                    set_temp(cfg, phone, {"order_id": text})
+                    set_state(cfg, phone, "update_what")
+                    send_update_options(cfg, phone)
 
             elif state == "update_delivery_custom_date":
-                from logic import parse_date as pd
-                parsed = pd(text)
+                parsed = parse_date(text)
                 if not parsed:
-                    send_back_button(phone, "❌ Invalid date. Enter as DD-MM-YYYY\nExample: 30-04-2026")
+                    send_back_button(cfg, phone, "❌ Invalid date. Enter as DD-MM-YYYY\nExample: 14-05-2026")
                     return "ok"
-                update_temp(phone, "delivery_date", parsed)
-                set_state(phone, "update_delivery_time")
-                send_delivery_time_picker(phone, parsed)
+                # ✅ Reject past dates
+                from datetime import datetime as dt_class
+                try:
+                    sel_dt = dt_class.strptime(parsed, "%d-%m-%Y")
+                    if sel_dt.date() < dt_class.now().date():
+                        send_back_button(cfg, phone, f"❌ {parsed} is in the past.\nPlease enter today or a future date:")
+                        return "ok"
+                except Exception:
+                    pass
+                update_temp(cfg, phone, "delivery_date", parsed)
+                set_state(cfg, phone, "update_delivery_time")
+                send_delivery_time_picker(cfg, phone, parsed)
+
+            elif state == "update_delivery_time":
+                pass  # Handled by del_time_ button
 
             elif state == "update_delivery_custom_time":
                 from datetime import datetime as dt_class
-                d = get_temp(phone)
+                d      = get_temp(cfg, phone)
                 dt_str = f"{d['delivery_date']} {text.strip()}"
-                dt = parse_delivery_datetime(dt_str)
+                dt     = parse_delivery_datetime(dt_str)
                 if not dt:
-                    send_back_button(phone, "❌ Invalid time. Enter as HH:MM\nExample: 14:00")
+                    send_back_button(cfg, phone, "❌ Invalid time. Enter as HH:MM\nExample: 14:00")
                     return "ok"
-                # ✅ Validate past time
                 if dt <= dt_class.now():
-                    send_back_button(phone, "⚠️ That time has already passed.\nEnter a future time as HH:MM\nExample: 14:00")
+                    send_back_button(cfg, phone, "⚠️ That time has already passed.\nEnter a future time as HH:MM")
                     return "ok"
                 delivery_str = format_delivery_str(dt)
-                order_id = d.get("order_id")
-                update_type = d.get("update_type", "delivery")
-                _apply_update(phone, order_id, update_type, d.get("new_status"), delivery_str)
+                _apply_update(cfg, phone, d.get("order_id"), d.get("update_type", "delivery"), d.get("new_status"), delivery_str)
 
             elif state == "view_order":
-                result = get_order_status(text, phone)
+                result = get_order_status(text, phone, cfg)
                 if "not found" in result.lower():
-                    send_back_button(phone, result + "\n\nPlease enter a valid Order ID:")
+                    send_back_button(cfg, phone, result + "\n\nPlease enter a valid Order ID:")
                 else:
-                    send_back_button(phone, result)
-                    clear_state(phone)
+                    send_back_button(cfg, phone, result)
+                    clear_state(cfg, phone)
 
             elif state == "check_status":
-                raw_result = get_order_status(text, phone)
-                if "❌" not in raw_result and "not found" not in raw_result.lower():
-                    send_text(phone, raw_result)
-                    clear_state(phone)
+                raw = get_order_status(text, phone, cfg)
+                if "❌" not in raw and "not found" not in raw.lower():
+                    send_text(cfg, phone, raw)
+                    clear_state(cfg, phone)
                 else:
-                    send_back_button(phone, raw_result + "\n\nPlease enter a valid Order ID:")
+                    send_back_button(cfg, phone, raw + "\n\nPlease enter a valid Order ID:")
 
             elif role == "customer" and text.strip().isdigit():
-                raw_result = get_order_status(text.strip(), phone)
-                if "❌" not in raw_result and "not found" not in raw_result.lower():
-                    send_text(phone, raw_result)
-                    clear_state(phone)
+                raw = get_order_status(text.strip(), phone, cfg)
+                if "❌" not in raw and "not found" not in raw.lower():
+                    send_text(cfg, phone, raw)
+                    clear_state(cfg, phone)
                 else:
-                    set_state(phone, "check_status")
-                    send_back_button(phone, raw_result + "\n\nPlease enter a valid Order ID:")
+                    set_state(cfg, phone, "check_status")
+                    send_back_button(cfg, phone, raw + "\n\nPlease enter a valid Order ID:")
 
             else:
                 if role == "staff":
-                    send_staff_menu(phone)
+                    send_staff_menu(cfg, phone)
                 else:
-                    send_customer_menu(phone)
+                    send_customer_menu(cfg, phone)
 
     except Exception:
-        print(f"[Webhook Error]\n{traceback.format_exc()}")
+        tb = traceback.format_exc()
+        print(f"[Webhook Error]\n{tb}")
+        try:
+            log_error(cfg, "webhook", tb)
+        except Exception:
+            pass
 
     return "ok"
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _apply_update(phone, order_id, update_type, new_status, delivery_str):
-    """Apply order update and send notifications."""
-    if update_type == "both":
-        success = update_order(order_id, new_status, delivery_str)
-        if success:
-            send_text(phone, f"✅ Order {order_id} updated\nStatus: {new_status}\nExpected Delivery: {delivery_str}")
-            cp   = get_customer_phone(order_id)
-            desc = get_order_desc(order_id)
-            if cp:
-                if is_ready(new_status):
-                    notify_ready(cp, order_id, desc)
-                elif is_cancelled(new_status):
-                    notify_cancelled(cp, order_id, desc)
-                else:
-                    # Use delivery_str directly — already updated in Excel
-                    notify_status_update(cp, order_id, new_status, desc, delivery_str, changed="both")
-        else:
-            send_text(phone, f"❌ Order {order_id} not found.")
-    else:
-        # Delivery only — notify customer with updated delivery time
-        current_status = get_current_status(order_id)
-        success = update_order(order_id, current_status, delivery_str)
-        if success:
-            send_text(phone, f"✅ Delivery time updated for Order {order_id}\nNew Expected Delivery: {delivery_str}")
-            cp   = get_customer_phone(order_id)
-            desc = get_order_desc(order_id)
-            if cp:
-                notify_status_update(cp, order_id, current_status, desc, delivery_str, changed="delivery")
-        else:
-            send_text(phone, f"❌ Order {order_id} not found.")
-    clear_state(phone)
-
-
-def get_order_desc(order_id):
-    """Get description for an order — used in notifications."""
-    from logic import get_all_rows, COL_ID, COL_DESC, _get_row_value
-    try:
-        rows = get_all_rows()
-        for row in rows:
-            if _get_row_value(row, COL_ID) == str(order_id):
-                return _get_row_value(row, COL_DESC)
-    except Exception:
-        pass
-    return ""
-
-
-def get_order_delivery(order_id):
-    """Get expected delivery time for an order."""
-    from logic import get_all_rows, COL_ID, COL_DELIVERY, _get_row_value
-    try:
-        rows = get_all_rows()
-        for row in rows:
-            if _get_row_value(row, COL_ID) == str(order_id):
-                return _get_row_value(row, COL_DELIVERY)
-    except Exception:
-        pass
-    return ""
-
-
-def get_current_status(order_id):
-    """Get current status of an order — used when updating delivery only."""
-    from logic import get_all_rows, COL_ID, COL_STATUS, _get_row_value
-    try:
-        rows = get_all_rows()
-        for row in rows:
-            if _get_row_value(row, COL_ID) == str(order_id):
-                return _get_row_value(row, COL_STATUS) or "Design Making"
-    except Exception:
-        pass
-    return "Design Making"
-
-
 if __name__ == "__main__":
-    import os
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=False)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False)

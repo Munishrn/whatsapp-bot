@@ -1,5 +1,4 @@
 flask
 requests
 python-dotenv
-gspread
-google-auth
+cryptography

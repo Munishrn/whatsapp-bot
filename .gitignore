@@ -1,5 +1,9 @@
-credentials.json
 .env
-orders.xlsx
+credentials.json
 user_state*
 temp_data*
+*.db
+__pycache__/
+*.pyc
+clients/*.json
+!clients/*.json.example
