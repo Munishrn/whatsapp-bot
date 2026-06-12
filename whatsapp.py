@@ -395,3 +395,166 @@ def send_delivery_time_picker(cfg, phone, selected_date):
             "action": {"button": "Choose Time", "sections": _safe_sections(sections)}
         }
     }, context=f"send_delivery_time_picker to {phone}")
+
+
+
+def send_template_message(cfg, phone, template_name, variables):
+    """
+    Send a WhatsApp approved template message.
+    variables: list of strings [var1, var2, var3...]
+    """
+    token   = cfg["access_token"]
+    pid     = cfg["phone_number_id"]
+    version = cfg.get("api_version", "v19.0")
+    url     = f"https://graph.facebook.com/{version}/{pid}/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    components = []
+    if variables:
+        components.append({
+            "type": "body",
+            "parameters": [
+                {"type": "text", "text": str(v)} for v in variables
+            ]
+        })
+
+    data = {
+        "messaging_product": "whatsapp",
+        "to":   phone,
+        "type": "template",
+        "template": {
+            "name":     template_name,
+            "language": {"code": "en"},
+            "components": components
+        }
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=data, timeout=10)
+        if not resp.ok:
+            print(f"[Template Error] {template_name} to {phone}: {resp.status_code} — {resp.text}")
+        return resp
+    except requests.exceptions.RequestException as e:
+        print(f"[Template Failed] {template_name} to {phone}: {e}")
+        return None
+
+
+def send_plate_making_template(cfg, phone, customer_name, order_id, description):
+    """
+    Send order_status_plate template.
+    Variables:
+        {{1}} = customer name
+        {{2}} = order ID
+        {{3}} = product description
+    """
+    return send_template_message(
+        cfg, phone,
+        template_name="order_status_plate",
+        variables=[customer_name, order_id, description]
+    )
+
+
+def send_template_message(cfg, phone, template_name, variables):
+    """
+    Send a WhatsApp approved template message.
+    variables: list of strings in order [var1, var2, var3...]
+    """
+    token    = cfg["access_token"]
+    pid      = cfg["phone_number_id"]
+    version  = cfg.get("api_version", "v19.0")
+    url      = f"https://graph.facebook.com/{version}/{pid}/messages"
+    headers  = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    components = []
+    if variables:
+        components.append({
+            "type": "body",
+            "parameters": [
+                {"type": "text", "text": str(v)} for v in variables
+            ]
+        })
+
+    data = {
+        "messaging_product": "whatsapp",
+        "to":   phone,
+        "type": "template",
+        "template": {
+            "name":     template_name,
+            "language": {"code": "en"},
+            "components": components
+        }
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=data, timeout=10)
+        if not resp.ok:
+            print(f"[Template Error] {template_name} to {phone}: {resp.status_code} — {resp.text}")
+        return resp
+    except requests.exceptions.RequestException as e:
+        print(f"[Template Failed] {template_name} to {phone}: {e}")
+        return None
+
+
+def send_plate_making_notification(cfg, phone, customer_name, order_id, description):
+    """
+    Send order_status_plate template notification to customer.
+    Template variables: {{1}}=name, {{2}}=order_id, {{3}}=description
+    """
+    return send_template_message(
+        cfg, phone,
+        template_name="order_status_plate",
+        variables=[customer_name, order_id, description]
+    )
+
+
+def send_template_message(cfg, phone, template_name, variables):
+    """
+    Send a WhatsApp approved template message.
+    variables: list of strings in order e.g. ["Rahul", "5", "Visiting Cards"]
+    """
+    token   = cfg["access_token"]
+    pid     = cfg["phone_number_id"]
+    version = cfg.get("api_version", "v19.0")
+    url     = f"https://graph.facebook.com/{version}/{pid}/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    components = []
+    if variables:
+        components.append({
+            "type": "body",
+            "parameters": [
+                {"type": "text", "text": str(v)} for v in variables
+            ]
+        })
+
+    data = {
+        "messaging_product": "whatsapp",
+        "to":   phone,
+        "type": "template",
+        "template": {
+            "name":     template_name,
+            "language": {"code": "en"},
+            "components": components
+        }
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=data, timeout=10)
+        if not resp.ok:
+            print(f"[Template Error] {template_name} to {phone}: {resp.status_code} — {resp.text}")
+        return resp
+    except requests.exceptions.RequestException as e:
+        print(f"[Template Failed] {template_name} to {phone}: {e}")
+        return None
+
+
+def send_plate_making_template(cfg, phone, customer_name, order_id, description):
+    """
+    Send order_status_plate template.
+    Template: Hello {{1}}, order {{2}}, product {{3}}
+    """
+    send_template_message(
+        cfg, phone,
+        template_name="order_status_plate",
+        variables=[customer_name, order_id, description]
+    )

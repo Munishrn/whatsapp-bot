@@ -33,6 +33,7 @@ from logic import (
     get_stale_orders,
     get_late_orders,
     get_order_desc,
+    get_customer_name,
     get_current_status,
 )
 
@@ -49,6 +50,8 @@ from whatsapp import (
     send_date_options,
     send_delivery_date_picker,
     send_delivery_time_picker,
+    send_plate_making_notification,
+    send_plate_making_template,
 )
 
 from logger import log_conversation, log_error, cleanup_old_logs
@@ -124,7 +127,19 @@ def notify_cancelled(cfg, phone, order_id, description=""):
     log_conversation(cfg, phone, "customer", "outgoing", msg)
 
 
-def notify_status_update(cfg, phone, order_id, status, description="", delivery="", changed="status"):
+def notify_status_update(cfg, phone, order_id, status, description="", delivery="", changed="status", customer_name=""):
+    """Send status update — uses WhatsApp template if available, falls back to regular message."""
+
+    # ✅ Use approved template for Plate Making
+    template_map = cfg.get("status_templates", {})
+    template_name = template_map.get(status.strip().lower())
+
+    if template_name == "order_status_plate":
+        send_plate_making_notification(cfg, phone, customer_name or "Customer", order_id, description)
+        log_conversation(cfg, phone, "customer", "outgoing", f"[Template: {template_name}] Order {order_id} - {status}")
+        return
+
+    # Fallback — regular message for non-template statuses
     status_emojis = {
         "design making":      "🎨",
         "plate making":       "🖼️",
@@ -422,10 +437,56 @@ def webhook():
                     send_customer_menu(cfg, phone)
 
             elif button_id == "todays_orders":
-                # ✅ Show all orders created today with ID, description, status
-                today   = get_today_str()
-                rows    = get_orders_by_date(today, phone, role, cfg)
+                today = get_today_str()
+                rows  = get_orders_by_date(today, phone, role, cfg)
                 send_back_button(cfg, phone, rows)
+
+            elif button_id == "broadcast_msg":
+                customers = get_all_unique_customers(cfg)
+                if not customers:
+                    send_text(cfg, phone, "❌ No customers found.")
+                    send_staff_menu(cfg, phone)
+                else:
+                    set_state(cfg, phone, "broadcast_select_customer")
+                    send_broadcast_customer_list(cfg, phone, customers)
+
+            elif button_id == "bc_all_customers" and state == "broadcast_select_customer":
+                customers = get_all_unique_customers(cfg)
+                update_temp(cfg, phone, "bc_recipients", [c["phone"] for c in customers])
+                update_temp(cfg, phone, "bc_recipient_name", f"All Customers ({len(customers)})")
+                set_state(cfg, phone, "broadcast_type_message")
+                send_back_button(cfg, phone, f"📢 Broadcast to All {len(customers)} Customers\n\nType your message:")
+
+            elif button_id.startswith("bc_customer_") and state == "broadcast_select_customer":
+                cust_phone = button_id.replace("bc_customer_", "")
+                cust_name  = interactive.get("list_reply", {}).get("title", cust_phone)
+                update_temp(cfg, phone, "bc_recipients", [cust_phone])
+                update_temp(cfg, phone, "bc_recipient_name", cust_name)
+                set_state(cfg, phone, "broadcast_type_message")
+                send_back_button(cfg, phone, f"📢 Broadcast to {cust_name}\n\nType your message:")
+
+            elif button_id == "bc_confirm_send":
+                d            = get_temp(cfg, phone)
+                recipients   = d.get("bc_recipients", [])
+                message      = d.get("bc_message", "")
+                sent_count   = 0
+                failed_count = 0
+                for recipient in recipients:
+                    try:
+                        send_text(cfg, recipient, f"📢 Message from {cfg.get('business_name')}:\n\n{message}")
+                        log_conversation(cfg, recipient, "customer", "outgoing", f"[Broadcast] {message}")
+                        sent_count += 1
+                    except Exception as e:
+                        failed_count += 1
+                        log_error(cfg, "broadcast_send", e)
+                send_text(cfg, phone, f"✅ Broadcast sent!\n📤 Sent: {sent_count}\n❌ Failed: {failed_count}")
+                clear_state(cfg, phone)
+                send_staff_menu(cfg, phone)
+
+            elif button_id == "bc_cancel":
+                send_text(cfg, phone, "❌ Broadcast cancelled.")
+                clear_state(cfg, phone)
+                send_staff_menu(cfg, phone)
 
             elif button_id == "create_order":
                 send_create_order_type(cfg, phone)
@@ -563,11 +624,7 @@ def webhook():
                         _apply_update(cfg, phone, order_id, update_type, new_status, delivery_str)
                     else:
                         order_id = create_order(d["name"], d["description"], d["status"], d["phone"], delivery_str, cfg)
-                        send_text(cfg, d["phone"],
-                            f"_📦 Order Created!_\n_Order ID: {order_id}_\n"
-                            f"_Product: {d['description']}_\n_Status: {d['status']}_\n"
-                            f"_Expected Delivery: {delivery_str}_"
-                        )
+                        send_order_created_notification(cfg, d["phone"], d["name"], order_id, d["description"], d["status"], delivery_str)
                         send_text(cfg, phone, f"✅ Order Created\nOrder ID: {order_id}\nExpected Delivery: {delivery_str}")
                         clear_state(cfg, phone)
 
@@ -580,10 +637,7 @@ def webhook():
                 if skip_delivery_for_status(status, cfg) or not feature_enabled(cfg, "expected_delivery"):
                     d        = get_temp(cfg, phone)
                     order_id = create_order(d["name"], d["description"], status, d["phone"], "", cfg)
-                    send_text(cfg, d["phone"],
-                        f"_📦 Order Created!_\n_Order ID: {order_id}_\n"
-                        f"_Product: {d['description']}_\n_Status: {status}_"
-                    )
+                    send_order_created_notification(cfg, d["phone"], d["name"], order_id, d["description"], status)
                     send_text(cfg, phone, f"✅ Order Created\nOrder ID: {order_id}\nStatus: {status}")
                     if is_cancelled_status(status, cfg):
                         notify_cancelled(cfg, d["phone"], order_id, d["description"])
@@ -618,8 +672,9 @@ def webhook():
                             elif is_cancelled_status(status, cfg):
                                 notify_cancelled(cfg, cp, order_id, desc)
                             else:
-                                delivery = ""
-                                notify_status_update(cfg, cp, order_id, status, desc, delivery, changed="status")
+                                delivery     = ""
+                                cust_name    = get_customer_name(order_id, cfg)
+                                notify_status_update(cfg, cp, order_id, status, desc, delivery, changed="status", customer_name=cust_name)
                     else:
                         send_text(cfg, phone, f"❌ Order {order_id} not found.")
                     clear_state(cfg, phone)
@@ -719,11 +774,7 @@ def webhook():
                     return "ok"
                 delivery_str = format_delivery_str(dt)
                 order_id = create_order(d["name"], d["description"], d["status"], d["phone"], delivery_str, cfg)
-                send_text(cfg, d["phone"],
-                    f"_📦 Order Created!_\n_Order ID: {order_id}_\n"
-                    f"_Product: {d['description']}_\n_Status: {d['status']}_\n"
-                    f"_Expected Delivery: {delivery_str}_"
-                )
+                send_order_created_notification(cfg, d["phone"], d["name"], order_id, d["description"], d["status"], delivery_str)
                 send_text(cfg, phone, f"✅ Order Created\nOrder ID: {order_id}\nExpected Delivery: {delivery_str}")
                 clear_state(cfg, phone)
 
