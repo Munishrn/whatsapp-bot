@@ -391,6 +391,22 @@ def health():
     return f"WhatsApp SaaS Bot — {len(clients)} client(s) active ✅", 200
 
 
+@app.route("/debug-config", methods=["GET"])
+def debug_config():
+    """Temporary debug route — shows loaded client configs (without secrets)."""
+    from config_loader import load_all_clients
+    clients = load_all_clients()
+    result = {}
+    for pid, cfg in clients.items():
+        result[pid] = {
+            "business_name": cfg.get("business_name"),
+            "status_templates": cfg.get("status_templates"),
+            "features": cfg.get("features"),
+            "statuses": cfg.get("statuses"),
+        }
+    return result, 200
+
+
 @app.route("/webhook", methods=["GET"])
 def verify():
     """Handle Meta webhook verification for all clients."""
