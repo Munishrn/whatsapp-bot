@@ -134,10 +134,7 @@ def send_order_created_notification(cfg, customer_phone, customer_name, order_id
     template_map  = cfg.get("status_templates", {})
     template_name = template_map.get(status.strip().lower())
 
-    if template_name:
-        send_plate_making_notification(cfg, customer_phone, customer_name, order_id, description)
-        log_conversation(cfg, customer_phone, "customer", "outgoing", f"[Template: {template_name}] Order {order_id} created - {status}")
-    else:
+    def _regular_message():
         if delivery_str:
             msg = (
                 f"_📦 Order Created!_\n_Order ID: {order_id}_\n"
@@ -152,6 +149,17 @@ def send_order_created_notification(cfg, customer_phone, customer_name, order_id
         send_text(cfg, customer_phone, msg)
         log_conversation(cfg, customer_phone, "customer", "outgoing", msg)
 
+    if template_name:
+        resp = send_plate_making_notification(cfg, customer_phone, customer_name, order_id, description)
+        if resp is not None and resp.ok:
+            log_conversation(cfg, customer_phone, "customer", "outgoing", f"[Template: {template_name}] Order {order_id} created - {status}")
+        else:
+            # ✅ Template failed (not approved yet, etc.) — fall back to regular message
+            log_error(cfg, "send_order_created_notification", f"Template '{template_name}' failed, falling back to regular message")
+            _regular_message()
+    else:
+        _regular_message()
+
 
 def notify_status_update(cfg, phone, order_id, status, description="", delivery="", changed="status", customer_name=""):
     """Send status update — uses WhatsApp template if available, falls back to regular message."""
@@ -161,11 +169,15 @@ def notify_status_update(cfg, phone, order_id, status, description="", delivery=
     template_name = template_map.get(status.strip().lower())
 
     if template_name:
-        send_plate_making_notification(cfg, phone, customer_name or "Customer", order_id, description)
-        log_conversation(cfg, phone, "customer", "outgoing", f"[Template: {template_name}] Order {order_id} - {status}")
-        return
+        resp = send_plate_making_notification(cfg, phone, customer_name or "Customer", order_id, description)
+        if resp is not None and resp.ok:
+            log_conversation(cfg, phone, "customer", "outgoing", f"[Template: {template_name}] Order {order_id} - {status}")
+            return
+        else:
+            log_error(cfg, "notify_status_update", f"Template '{template_name}' failed, falling back to regular message")
+            # Fall through to regular message below
 
-    # Fallback — regular message for non-template statuses
+    # Fallback — regular message for non-template statuses or failed template
     status_emojis = {
         "design making":      "🎨",
         "plate making":       "🖼️",
