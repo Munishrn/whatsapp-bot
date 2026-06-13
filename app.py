@@ -133,9 +133,12 @@ def send_order_created_notification(cfg, customer_phone, customer_name, order_id
     """
     template_map  = cfg.get("status_templates", {})
     template_name = template_map.get(status.strip().lower())
+    print(f"[DEBUG] send_order_created_notification — status='{status}' lower='{status.strip().lower()}' template_map={template_map} template_name={template_name}")
 
     if template_name:
-        send_plate_making_notification(cfg, customer_phone, customer_name, order_id, description)
+        print(f"[DEBUG] Sending template '{template_name}' to {customer_phone}")
+        resp = send_plate_making_notification(cfg, customer_phone, customer_name, order_id, description)
+        print(f"[DEBUG] Template response: {resp.status_code if resp else 'None'} — {resp.text if resp else 'No response'}")
         log_conversation(cfg, customer_phone, "customer", "outgoing", f"[Template: {template_name}] Order {order_id} created - {status}")
     else:
         if delivery_str:
