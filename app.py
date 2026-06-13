@@ -160,7 +160,7 @@ def notify_status_update(cfg, phone, order_id, status, description="", delivery=
     template_map = cfg.get("status_templates", {})
     template_name = template_map.get(status.strip().lower())
 
-    if template_name == "order_status_plate":
+    if template_name:
         send_plate_making_notification(cfg, phone, customer_name or "Customer", order_id, description)
         log_conversation(cfg, phone, "customer", "outgoing", f"[Template: {template_name}] Order {order_id} - {status}")
         return
