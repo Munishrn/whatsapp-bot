@@ -441,11 +441,11 @@ def send_template_message(cfg, phone, template_name, variables):
 
 def send_plate_making_notification(cfg, phone, customer_name, order_id, description):
     """
-    Send order_status_plate template notification to customer.
+    Send order_status_plate_making template notification to customer.
     Template variables: {{1}}=name, {{2}}=order_id, {{3}}=description
     """
     return send_template_message(
         cfg, phone,
-        template_name="order_status_plate",
+        template_name="order_status_plate_making",
         variables=[customer_name, order_id, description]
     )
