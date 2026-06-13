@@ -675,6 +675,7 @@ def webhook():
 
             elif button_id.startswith("status_") and state == "create_status":
                 status = status_map.get(button_id)
+                print(f"[DEBUG] create_status handler — button_id={button_id} status={status} state={state}")
                 if not status:
                     send_text(cfg, phone, "❌ Invalid status selected.")
                     return "ok"
