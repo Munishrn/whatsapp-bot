@@ -51,7 +51,6 @@ from whatsapp import (
     send_delivery_date_picker,
     send_delivery_time_picker,
     send_plate_making_notification,
-    send_plate_making_template,
 )
 
 from logger import log_conversation, log_error, cleanup_old_logs
@@ -125,6 +124,33 @@ def notify_cancelled(cfg, phone, order_id, description=""):
     msg += "\n_Please contact us for more details._"
     send_text(cfg, phone, msg)
     log_conversation(cfg, phone, "customer", "outgoing", msg)
+
+
+def send_order_created_notification(cfg, customer_phone, customer_name, order_id, description, status, delivery_str=""):
+    """
+    Send order created notification to customer.
+    Uses WhatsApp template if status has one configured, else regular message.
+    """
+    template_map  = cfg.get("status_templates", {})
+    template_name = template_map.get(status.strip().lower())
+
+    if template_name:
+        send_plate_making_notification(cfg, customer_phone, customer_name, order_id, description)
+        log_conversation(cfg, customer_phone, "customer", "outgoing", f"[Template: {template_name}] Order {order_id} created - {status}")
+    else:
+        if delivery_str:
+            msg = (
+                f"_📦 Order Created!_\n_Order ID: {order_id}_\n"
+                f"_Product: {description}_\n_Status: {status}_\n"
+                f"_Expected Delivery: {delivery_str}_"
+            )
+        else:
+            msg = (
+                f"_📦 Order Created!_\n_Order ID: {order_id}_\n"
+                f"_Product: {description}_\n_Status: {status}_"
+            )
+        send_text(cfg, customer_phone, msg)
+        log_conversation(cfg, customer_phone, "customer", "outgoing", msg)
 
 
 def notify_status_update(cfg, phone, order_id, status, description="", delivery="", changed="status", customer_name=""):

@@ -368,17 +368,3 @@ def get_stale_orders(cfg, hours=6):
             from logger import log_error
             log_error(cfg, "get_stale_orders", e)
             return []
-
-
-
-def get_customer_name(order_id, cfg):
-    """Get customer name for an order."""
-    with sheets_lock:
-        try:
-            rows = _get_all_rows(cfg)
-            for row in rows:
-                if _get_row_value(row, COL_ID) == str(order_id):
-                    return _get_row_value(row, COL_NAME)
-        except Exception:
-            pass
-    return "Customer"
