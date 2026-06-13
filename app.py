@@ -474,6 +474,8 @@ def webhook():
             else:
                 return "ok"
 
+            print(f"[DEBUG] Interactive button_id='{button_id}' state='{state}' role='{role}'")
+
             if button_id == "back_to_menu":
                 clear_state(cfg, phone)
                 if role == "staff":
