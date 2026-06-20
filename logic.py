@@ -187,6 +187,69 @@ def get_orders_by_date(date_str, phone, role, cfg):
             return "❌ Order system not available. Please try again later."
 
 
+def get_orders_by_date_range(phone, role, cfg, days=30):
+    """
+    Returns all orders placed in the last `days` days.
+    For customers, only their own orders are shown.
+    """
+    from datetime import timedelta
+    cutoff = datetime.now() - timedelta(days=days)
+
+    with sheets_lock:
+        try:
+            rows    = _get_all_rows(cfg)
+            matched = []
+            for row in rows:
+                if not _get_row_value(row, COL_ID):
+                    continue
+
+                row_date_str = _get_row_value(row, COL_DATE)
+                if not row_date_str:
+                    continue
+                try:
+                    row_date = datetime.strptime(row_date_str, "%d-%m-%Y")
+                except ValueError:
+                    continue
+
+                if row_date < cutoff:
+                    continue
+
+                delivery = _get_row_value(row, COL_DELIVERY) or "N/A"
+                status   = _get_row_value(row, COL_STATUS)
+
+                if role == "staff":
+                    matched.append({
+                        "date": row_date,
+                        "text": (
+                            f"🆔 {_get_row_value(row, COL_ID)} | 👤 {_get_row_value(row, COL_NAME)} | 📦 {_get_row_value(row, COL_DESC)}\n"
+                            f"   Status: {status} | 📅 {row_date_str} | 🕐 {delivery}"
+                        )
+                    })
+                else:
+                    if _get_row_value(row, COL_PHONE) == str(phone):
+                        matched.append({
+                            "date": row_date,
+                            "text": (
+                                f"🆔 {_get_row_value(row, COL_ID)} | 📦 {_get_row_value(row, COL_DESC)}\n"
+                                f"   Status: {status} | 📅 {row_date_str} | 🕐 {delivery}"
+                            )
+                        })
+
+            if not matched:
+                return f"No orders found in the last {days} days 📭"
+
+            # Sort newest first
+            matched.sort(key=lambda x: x["date"], reverse=True)
+
+            header = f"📅 Orders in Last {days} Days ({len(matched)} found):\n"
+            header += "─" * 30 + "\n"
+            return header + "\n\n".join(m["text"] for m in matched)
+        except Exception as e:
+            from logger import log_error
+            log_error(cfg, "get_orders_by_date_range", e)
+            return "❌ Order system not available. Please try again later."
+
+
 def generate_order_id(rows):
     max_id = 0
     for row in rows:

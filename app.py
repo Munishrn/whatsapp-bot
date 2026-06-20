@@ -21,6 +21,7 @@ from logic import (
     get_user_role,
     get_order_status,
     get_orders_by_date,
+    get_orders_by_date_range,
     create_order,
     update_order,
     get_customer_phone,
@@ -592,6 +593,22 @@ def webhook():
                 else:
                     set_state(cfg, phone, "view_by_date")
                     send_date_options(cfg, phone)
+
+            elif button_id == "orders_last_30":
+                if not feature_enabled(cfg, "orders_by_date"):
+                    send_text(cfg, phone, "❌ This feature is not enabled for your account.")
+                else:
+                    result = get_orders_by_date_range(phone, role, cfg, days=30)
+                    send_back_button(cfg, phone, result)
+                clear_state(cfg, phone)
+
+            elif button_id == "orders_last_60":
+                if not feature_enabled(cfg, "orders_by_date"):
+                    send_text(cfg, phone, "❌ This feature is not enabled for your account.")
+                else:
+                    result = get_orders_by_date_range(phone, role, cfg, days=60)
+                    send_back_button(cfg, phone, result)
+                clear_state(cfg, phone)
 
             elif button_id.startswith("filter_date_") and state == "view_by_date":
                 date_val = button_id.replace("filter_date_", "")

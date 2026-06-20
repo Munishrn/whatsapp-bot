@@ -130,8 +130,9 @@ def send_customer_menu(cfg, phone):
             "body": {"text": welcome},
             "action": {
                 "buttons": [
-                    {"type": "reply", "reply": {"id": "check_status", "title": "Track Order"}},
-                    {"type": "reply", "reply": {"id": "view_by_date", "title": "Orders by Date"}},
+                    {"type": "reply", "reply": {"id": "check_status",      "title": "Track Order"}},
+                    {"type": "reply", "reply": {"id": "orders_last_30",    "title": "Last 30 Days"}},
+                    {"type": "reply", "reply": {"id": "orders_last_60",    "title": "Last 60 Days"}},
                 ]
             }
         }
