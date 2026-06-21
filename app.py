@@ -404,6 +404,15 @@ def health():
     return f"WhatsApp SaaS Bot — {len(clients)} client(s) active ✅", 200
 
 
+@app.route("/debug-clients", methods=["GET"])
+def debug_clients():
+    """Temporary — shows phone_number_ids loaded for all clients."""
+    from config_loader import load_all_clients
+    clients = load_all_clients()
+    result = {pid: cfg.get("business_name") for pid, cfg in clients.items()}
+    return result, 200
+
+
 
 @app.route("/webhook", methods=["GET"])
 def verify():
