@@ -405,6 +405,7 @@ def health():
 
 
 
+
 @app.route("/webhook", methods=["GET"])
 def verify():
     """Handle Meta webhook verification for all clients."""
@@ -422,6 +423,7 @@ def verify():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
+    print(f"[Webhook RAW] {data}")
 
     try:
         entry = data.get("entry", [])
